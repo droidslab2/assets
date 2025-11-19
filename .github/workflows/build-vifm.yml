@@ -1,0 +1,120 @@
+name: Build Vifm Android Assets
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 0" # Weekly
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y wget dpkg unzip zip jq
+
+      - name: Get latest version from Termux repo
+        id: version
+        run: |
+          PACKAGE_DATA=$(wget -qO - https://grimler.se/termux-main/dists/stable/main/binary-aarch64/Packages.gz | gunzip )
+          VERSION=$(echo "$PACKAGE_DATA" | awk '/^Package: vifm/,/^Description/' | grep Version | awk '{print $2}')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check cached version
+        id: cached
+        run: |
+          CURRENT=$(cat .vifm-version 2>/dev/null || echo "none")
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+
+      - name: Skip if version unchanged
+        if: steps.cached.outputs.current == steps.version.outputs.version
+        run: |
+          echo "No new version. Skipping."
+          exit 0
+
+      - name: Save updated version
+        run: echo "${{ steps.version.outputs.version }}" > .vifm-version
+
+      - name: Download all ABIs
+        run: |
+          mkdir -p downloads
+          declare -A URLS=(
+            ["aarch64"]="https://grimler.se/termux-main/pool/main/v/vifm/vifm_${{ steps.version.outputs.version }}_aarch64.deb"
+            ["arm"]="https://grimler.se/termux-main/pool/main/v/vifm/vifm_${{ steps.version.outputs.version }}_arm.deb"
+            ["i686"]="https://grimler.se/termux-main/pool/main/v/vifm/vifm_${{ steps.version.outputs.version }}_i686.deb"
+            ["x86_64"]="https://grimler.se/termux-main/pool/main/v/vifm/vifm_${{ steps.version.outputs.version }}_x86_64.deb"
+          )
+
+          for ABI in "${!URLS[@]}"; do
+            wget -O "downloads/$ABI.deb" "${URLS[$ABI]}"
+          done
+
+      - name: Extract .deb packages
+        run: |
+          mkdir -p output
+          for ABI in aarch64 arm i686 x86_64; do
+            mkdir -p output/$ABI
+            dpkg-deb -x "downloads/$ABI.deb" "output/$ABI"
+          done
+
+      - name: Remove /data/data/com.termux prefix and fix symlinks
+        run: |
+          for ABI in aarch64 arm i686 x86_64; do
+            TARGET_DIR="output/$ABI"
+
+            # Step 1: Move actual files
+            if [ -d "$TARGET_DIR/data/data/com.termux" ]; then
+              mv "$TARGET_DIR/data/data/com.termux/"* "$TARGET_DIR/"
+              rm -rf "$TARGET_DIR/data"
+            fi
+
+            # Step 2: Fix symlinks that still contain the original Termux prefix
+            cd "$TARGET_DIR"
+
+            # Find symlinks and rewrite their targets
+            find . -type l | while read LINK; do
+              TARGET=$(readlink "$LINK")
+
+              if [[ "$TARGET" == */data/data/com.termux/* ]]; then
+                # remove prefix
+                NEW_TARGET="${TARGET#*/data/data/com.termux/}"
+                ln -snf "$NEW_TARGET" "$LINK"
+              fi
+            done
+
+            cd - >/dev/null
+          done
+
+      - name: Create zip archives
+        run: |
+          mkdir -p releases
+          for ABI in aarch64 arm i686 x86_64; do
+            zip -r "releases/vifm_${{ steps.version.outputs.version }}_${ABI}.zip" "output/$ABI"
+          done
+
+      - name: Upload artifacts to GitHub Action
+        uses: actions/upload-artifact@v4
+        with:
+          name: vifm-zips
+          path: releases/*.zip
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "vifm-${{ steps.version.outputs.version }}"
+          name: "Vifm ${{ steps.version.outputs.version }}"
+          draft: false
+          prerelease: false
+          files: releases/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit version update
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update Vifm version: ${{ steps.version.outputs.version }}"
